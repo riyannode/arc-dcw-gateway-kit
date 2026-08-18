@@ -120,7 +120,6 @@ Circle credentials belong only in the server runtime. The runnable example retur
 
 ## Current limitations
 
-- live Arc Testnet / Circle E2E remains pending because credentials are unavailable
 - the example uses process-lifetime in-memory stores and must be replaced with durable application persistence before production
 - Circle credentials and network contract addresses must be supplied through server-only configuration
 - PayLabs integration is intentionally not included in this standalone PR
