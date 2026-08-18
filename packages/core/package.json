@@ -1,0 +1,1 @@
+{"name":"@arc-dcw-gateway-kit/core","version":"0.1.0","type":"module","exports":{".":{"types":"./dist/index.d.ts","import":"./dist/index.js"}},"scripts":{"build":"bunx tsc -p tsconfig.json"}}

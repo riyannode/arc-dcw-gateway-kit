@@ -1,0 +1,1 @@
+{"name": "@arc-dcw-gateway-kit/circle-dcw", "version": "0.1.0", "type": "module", "exports": {".": {"types": "./dist/index.d.ts", "import": "./dist/index.js"}}, "dependencies": {"@circle-fin/developer-controlled-wallets": "^10.6.0", "@arc-dcw-gateway-kit/core": "workspace:*"}}

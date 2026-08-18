@@ -1,0 +1,1 @@
+{"name":"@arc-dcw-gateway-kit/react","version":"0.1.0","type":"module","exports":{".":{"types":"./dist/index.d.ts","import":"./dist/index.js"}},"dependencies":{"react":"^19.1.0","@arc-dcw-gateway-kit/core":"workspace:*"}}

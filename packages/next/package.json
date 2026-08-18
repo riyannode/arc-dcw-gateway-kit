@@ -1,0 +1,1 @@
+{"name": "@arc-dcw-gateway-kit/next", "version": "0.1.0", "type": "module", "exports": {".": {"types": "./dist/index.d.ts", "import": "./dist/index.js"}}, "dependencies": {"@arc-dcw-gateway-kit/core": "workspace:*"}}
