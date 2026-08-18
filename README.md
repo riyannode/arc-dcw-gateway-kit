@@ -100,10 +100,6 @@ await service.advanceWithdrawal(withdrawal.id)
 
 The kit uses Circle DCW SDK operations and Gateway `POST /v1/balances`, `POST /v1/estimate`, `POST /v1/transfer`, and `GET /v1/transfer/{id}` APIs. It does not replace those SDKs or invent a new Gateway protocol. Its reusable layer is the durable identity→wallet→funding→withdrawal lifecycle and recovery contract.
 
-## Arc ecosystem / prior art
-
-Arc OSS asks for open, forkable reusable primitives with clear documentation. The current Arc Showcase was reviewed as a prior-art index, and Circle’s current `circlefin/arc-*` repositories were inspected at repository metadata level, including `arc-commerce`, `arc-p2p-payments`, `arc-nanopayments`, `arc-fintech`, `arc-multichain-wallet`, and `arc-x402-circle-wallets`. Those projects establish relevant Circle/Arc patterns; this project is deliberately not claiming that wallet, Gateway, signing, or modal operations are individually novel. The defensible differentiation is the combined durable application-user lifecycle and explicit ambiguous-outcome recovery contract.
-
 ## What this is not
 
 Not a replacement for Circle SDKs, not an x402 facilitator, not a custody provider, not a browser private-key wallet, not merely a wallet modal or Gateway balance widget, and not a new Gateway protocol.
@@ -122,7 +118,6 @@ Circle credentials belong only in the server runtime. The runnable example retur
 
 - the example uses process-lifetime in-memory stores and must be replaced with durable application persistence before production
 - Circle credentials and network contract addresses must be supplied through server-only configuration
-- PayLabs integration is intentionally not included in this standalone PR
 
 
 ## Provenance and license
