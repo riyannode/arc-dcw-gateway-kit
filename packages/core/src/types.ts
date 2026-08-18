@@ -103,6 +103,8 @@ export interface DepositRecord {
   status: DepositStatus;
   approvalTransactionId: string | null;
   depositTransactionId: string | null;
+  approvalIdempotencyKey: string;
+  depositIdempotencyKey: string;
   errorCode: string | null;
   errorMessage: string | null;
   createdAt: string;
@@ -114,6 +116,8 @@ export interface CreateDepositInput {
   wallet: StoredWallet;
   amountAtomic: string;
   idempotencyKey: string;
+  approvalIdempotencyKey: string;
+  depositIdempotencyKey: string;
 }
 
 export interface GatewayEstimate {

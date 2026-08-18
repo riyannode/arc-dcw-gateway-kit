@@ -66,6 +66,8 @@ export function createDcwGatewayService(deps: {
         wallet,
         amountAtomic: input.amountAtomic,
         idempotencyKey: input.idempotencyKey,
+        approvalIdempotencyKey: crypto.randomUUID(),
+        depositIdempotencyKey: crypto.randomUUID(),
       })
     ).record;
   }
@@ -116,19 +118,32 @@ export function createDcwGatewayService(deps: {
     if (!row) throw new Error("Deposit not found");
     if (row.status === "finalized" || row.status === "failed") return row;
 
+    const canRetryApproval = (record: DepositRecord) =>
+      record.status === "reconciliation_required" &&
+      record.errorCode === "approval_ambiguous" &&
+      !record.approvalTransactionId;
+
+    const canRetryDeposit = (record: DepositRecord) =>
+      record.status === "reconciliation_required" &&
+      record.errorCode === "deposit_ambiguous" &&
+      !record.depositTransactionId;
+
     if (row.status === "reconciliation_required") {
       row = await reconcileDepositRecord(row);
-      if (row.status === "reconciliation_required") return row;
       if (row.status === "finalized" || row.status === "failed") return row;
+      if (row.status === "reconciliation_required" && !canRetryApproval(row) && !canRetryDeposit(row)) return row;
     }
 
     const wallet = await getOrCreateWallet();
-    if (row.status === "prepared") {
+    if (row.status === "prepared" || canRetryApproval(row)) {
+      const expected = row.status;
       try {
-        const tx = await dcw.approveGateway(wallet, row.amountAtomic, `${row.id}:approval`);
+        const tx = await dcw.approveGateway(wallet, row.amountAtomic, row.approvalIdempotencyKey);
         return (
-          (await deposits.compareAndSet(row.id, "prepared", "approval_submitted", {
+          (await deposits.compareAndSet(row.id, expected, "approval_submitted", {
             approvalTransactionId: tx.transactionId,
+            errorCode: null,
+            errorMessage: null,
           })) ?? (await deposits.findById(row.id))!
         );
       } catch (error) {
@@ -146,12 +161,15 @@ export function createDcwGatewayService(deps: {
       return reconcileDepositRecord(row);
     }
 
-    if (row.status === "approval_confirmed") {
+    if (row.status === "approval_confirmed" || canRetryDeposit(row)) {
+      const expected = row.status;
       try {
-        const tx = await dcw.depositGateway(wallet, row.amountAtomic, `${row.id}:deposit`);
+        const tx = await dcw.depositGateway(wallet, row.amountAtomic, row.depositIdempotencyKey);
         return (
-          (await deposits.compareAndSet(row.id, "approval_confirmed", "deposit_submitted", {
+          (await deposits.compareAndSet(row.id, expected, "deposit_submitted", {
             depositTransactionId: tx.transactionId,
+            errorCode: null,
+            errorMessage: null,
           })) ?? (await deposits.findById(row.id))!
         );
       } catch (error) {
@@ -328,8 +346,21 @@ export function createDcwGatewayService(deps: {
       const wallet = await getOrCreateWallet();
       const signed = await withdrawals.compareAndSet(row.id, "prepared", "burn_signed");
       if (!signed) return (await withdrawals.findById(row.id))!;
+
+      let signature: string;
       try {
-        const signature = await dcw.signBurnIntent(wallet, row.burnIntent);
+        signature = await dcw.signBurnIntent(wallet, row.burnIntent);
+      } catch (error) {
+        return (
+          (await withdrawals.update(row.id, {
+            status: "failed",
+            errorCode: "signing_failed",
+            errorMessage: message(error),
+          })) ?? row
+        );
+      }
+
+      try {
         const sent = await gateway.submit(row.burnIntent, signature);
         return (
           (await withdrawals.compareAndSet(row.id, "burn_signed", "gateway_submitted", {
