@@ -229,7 +229,51 @@ export function createDcwGatewayService(deps: {
     if (!row) throw new Error("Withdrawal not found");
     if (row.status === "finalized" || row.status === "failed" || row.status === "expired") return row;
 
+    let transfer: Awaited<ReturnType<GatewayClient["getTransfer"]>> | undefined;
     let circleFailure = false;
+    if (row.transferId) {
+      try {
+        transfer = await gateway.getTransfer(row.transferId);
+      } catch (error) {
+        return (
+          (await withdrawals.update(row.id, {
+            status: "reconciliation_required",
+            errorCode: "gateway_unavailable",
+            errorMessage: message(error),
+          })) ?? row
+        );
+      }
+
+      const status = transfer.status.toLowerCase();
+      if (status === "confirmed" || status === "finalized") {
+        if (!transfer.transactionHash) {
+          return (await withdrawals.update(row.id, {
+            status: "reconciliation_required",
+            errorCode: "missing_gateway_transaction_hash",
+            errorMessage: "Gateway terminal transfer has no destination transaction hash",
+          })) ?? row;
+        }
+        return (await withdrawals.update(row.id, {
+          status: "finalized",
+          txHash: transfer.transactionHash,
+        })) ?? row;
+      }
+      if (status === "failed" || status === "expired") {
+        return (await withdrawals.update(row.id, {
+          status: "failed",
+          errorCode: `gateway_${status}`,
+          errorMessage: `Gateway transfer ${status}`,
+        })) ?? row;
+      }
+      if (status !== "pending") {
+        return (await withdrawals.update(row.id, {
+          status: "reconciliation_required",
+          errorCode: "gateway_unknown_status",
+          errorMessage: `Gateway status ${transfer.status}`,
+        })) ?? row;
+      }
+    }
+
     if (row.circleTransactionId && ["mint_submitted", "reconciliation_required"].includes(row.status)) {
       try {
         const tx = await dcw.getTransaction(row.circleTransactionId);
@@ -246,36 +290,12 @@ export function createDcwGatewayService(deps: {
       }
     }
 
-    if (!row.transferId) {
-      return (
-        (await withdrawals.update(row.id, {
-          status: "reconciliation_required",
-          errorCode: "missing_authoritative_identifier",
-          errorMessage: "No Gateway transferId or Circle transaction ID is persisted",
-        })) ?? row
-      );
-    }
-
-    let transfer;
-    try {
-      transfer = await gateway.getTransfer(row.transferId);
-    } catch (error) {
-      return (
-        (await withdrawals.update(row.id, {
-          status: "reconciliation_required",
-          errorCode: "gateway_unavailable",
-          errorMessage: message(error),
-        })) ?? row
-      );
-    }
-
-    const status = transfer.status.toLowerCase();
-    if (status === "confirmed" || status === "finalized") {
+    if (transfer) {
       if (!transfer.attestationPayload || !transfer.attestationSignature) {
         return (await withdrawals.update(row.id, {
           status: "reconciliation_required",
-          errorCode: "gateway_confirmed_pending_mint",
-          errorMessage: "Gateway transfer is terminal but no mint attestation is available",
+          errorCode: "missing_attestation",
+          errorMessage: "Gateway pending without attestation",
         })) ?? row;
       }
       const current = await withdrawals.findById(row.id);
@@ -285,34 +305,14 @@ export function createDcwGatewayService(deps: {
         attestationSignature: transfer.attestationSignature,
       }, circleFailure);
     }
-    if (status === "failed" || status === "expired") {
-      return (await withdrawals.update(row.id, {
-        status: "failed",
-        errorCode: `gateway_${status}`,
-        errorMessage: `Gateway transfer ${status}`,
-      })) ?? row;
-    }
-    if (status !== "pending") {
-      return (await withdrawals.update(row.id, {
-        status: "reconciliation_required",
-        errorCode: "gateway_unknown_status",
-        errorMessage: `Gateway status ${transfer.status}`,
-      })) ?? row;
-    }
-    if (!transfer.attestationPayload || !transfer.attestationSignature) {
-      return (await withdrawals.update(row.id, {
-        status: "reconciliation_required",
-        errorCode: "missing_attestation",
-        errorMessage: "Gateway pending without attestation",
-      })) ?? row;
-    }
 
-    const current = await withdrawals.findById(row.id);
-    if (!current) throw new Error("Withdrawal disappeared during reconciliation");
-    return persistMint(current, {
-      attestationPayload: transfer.attestationPayload,
-      attestationSignature: transfer.attestationSignature,
-    }, circleFailure);
+    return (
+      (await withdrawals.update(row.id, {
+        status: "reconciliation_required",
+        errorCode: "missing_authoritative_identifier",
+        errorMessage: "No Gateway transferId or Circle transaction ID is persisted",
+      })) ?? row
+    );
   }
 
   async function advanceWithdrawal(id: string): Promise<WithdrawalRecord> {

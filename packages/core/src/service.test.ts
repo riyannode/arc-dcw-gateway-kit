@@ -23,8 +23,24 @@ const network = {
   usdcAddress: "0x3600000000000000000000000000000000000000",
 };
 
-function fixture(mode: "success" | "approval-fail" | "approval-ambiguous" | "gateway-ambiguous" = "success") {
+function fixture(
+  mode: "success" | "approval-fail" | "approval-ambiguous" | "gateway-ambiguous" = "success",
+  transfer: {
+    status: string;
+    attestationPayload: string | null;
+    attestationSignature: string | null;
+    expirationBlock: string | null;
+    transactionHash: string | null;
+  } = {
+    status: "pending",
+    attestationPayload: "0x1234",
+    attestationSignature: "0xabcd",
+    expirationBlock: "88",
+    transactionHash: null,
+  },
+) {
   const states = new Map<string, string>();
+  const mintCalls = { count: 0 };
   const dcw: DcwWalletProvider = {
     async provisionWallet() {
       return wallet;
@@ -49,6 +65,7 @@ function fixture(mode: "success" | "approval-fail" | "approval-ambiguous" | "gat
       return "0xsig";
     },
     async mint(_wallet, _payload, _signature, id) {
+      mintCalls.count += 1;
       states.set(id, "PENDING");
       return { transactionId: id };
     },
@@ -85,11 +102,7 @@ function fixture(mode: "success" | "approval-fail" | "approval-ambiguous" | "gat
     async getTransfer() {
       return {
         transferId: "transfer-1",
-        status: "pending",
-        attestationPayload: "0x1234",
-        attestationSignature: "0xabcd",
-        expirationBlock: "88",
-        transactionHash: null,
+        ...transfer,
       };
     },
     async getBalances() {
@@ -107,7 +120,7 @@ function fixture(mode: "success" | "approval-fail" | "approval-ambiguous" | "gat
     gateway,
     gatewayNetwork: network,
   });
-  return { service, withdrawals, deposits, states };
+  return { service, withdrawals, deposits, states, mintCalls };
 }
 
 describe("durable deposit and withdrawal recovery", () => {
@@ -150,8 +163,98 @@ describe("durable deposit and withdrawal recovery", () => {
     expect(replay.status).toBe("reconciliation_required");
   });
 
+  it("mints exactly once for pending Gateway attestation", async () => {
+    const { service, withdrawals, mintCalls } = fixture();
+    const withdrawal = await service.prepareWithdrawal({ amountAtomic: "1", availableAtomic: "5", idempotencyKey: "pending-mint" });
+    await withdrawals.update(withdrawal.id, {
+      status: "reconciliation_required",
+      transferId: "transfer-1",
+    });
+    const submitted = await service.reconcileWithdrawal(withdrawal.id);
+    expect(mintCalls.count).toBe(1);
+    expect(submitted.status).toBe("mint_submitted");
+  });
+
+  it("does not mint a pending Gateway transfer without attestation", async () => {
+    const { service, withdrawals, mintCalls } = fixture("success", {
+      status: "pending",
+      attestationPayload: null,
+      attestationSignature: null,
+      expirationBlock: "88",
+      transactionHash: null,
+    });
+    const withdrawal = await service.prepareWithdrawal({ amountAtomic: "1", availableAtomic: "5", idempotencyKey: "pending-no-attestation" });
+    await withdrawals.update(withdrawal.id, {
+      status: "reconciliation_required",
+      transferId: "transfer-1",
+    });
+    const recovered = await service.reconcileWithdrawal(withdrawal.id);
+    expect(mintCalls.count).toBe(0);
+    expect(recovered.status).toBe("reconciliation_required");
+  });
+
+  it.each(["confirmed", "finalized"] as const)("finalizes %s Gateway transfers without minting", async (status) => {
+    const { service, withdrawals, mintCalls } = fixture("success", {
+      status,
+      attestationPayload: null,
+      attestationSignature: null,
+      expirationBlock: null,
+      transactionHash: "0xdestination-mint",
+    });
+    const withdrawal = await service.prepareWithdrawal({ amountAtomic: "1", availableAtomic: "5", idempotencyKey: `gateway-${status}` });
+    await withdrawals.update(withdrawal.id, {
+      status: "reconciliation_required",
+      transferId: "transfer-1",
+      circleTransactionId: "failed-circle-tx",
+    });
+    const recovered = await service.reconcileWithdrawal(withdrawal.id);
+    expect(mintCalls.count).toBe(0);
+    expect(recovered.status).toBe("finalized");
+    expect(recovered.txHash).toBe("0xdestination-mint");
+  });
+
+  it("treats terminal Gateway status as authoritative after a failed Circle mint", async () => {
+    const { service, withdrawals, states, mintCalls } = fixture("success", {
+      status: "confirmed",
+      attestationPayload: null,
+      attestationSignature: null,
+      expirationBlock: null,
+      transactionHash: "0xauthoritative-mint",
+    });
+    const withdrawal = await service.prepareWithdrawal({ amountAtomic: "1", availableAtomic: "5", idempotencyKey: "gateway-authoritative" });
+    await withdrawals.update(withdrawal.id, {
+      status: "reconciliation_required",
+      transferId: "transfer-1",
+      circleTransactionId: "failed-circle-tx",
+    });
+    states.set("failed-circle-tx", "FAILED");
+    const recovered = await service.reconcileWithdrawal(withdrawal.id);
+    expect(mintCalls.count).toBe(0);
+    expect(recovered.status).toBe("finalized");
+    expect(recovered.txHash).toBe("0xauthoritative-mint");
+  });
+
+  it("fails closed for a terminal Gateway transfer without transactionHash", async () => {
+    const { service, withdrawals, mintCalls } = fixture("success", {
+      status: "confirmed",
+      attestationPayload: null,
+      attestationSignature: null,
+      expirationBlock: null,
+      transactionHash: null,
+    });
+    const withdrawal = await service.prepareWithdrawal({ amountAtomic: "1", availableAtomic: "5", idempotencyKey: "gateway-no-hash" });
+    await withdrawals.update(withdrawal.id, {
+      status: "reconciliation_required",
+      transferId: "transfer-1",
+    });
+    const recovered = await service.reconcileWithdrawal(withdrawal.id);
+    expect(mintCalls.count).toBe(0);
+    expect(recovered.status).toBe("reconciliation_required");
+    expect(recovered.errorCode).toBe("missing_gateway_transaction_hash");
+  });
+
   it("recovers pending Gateway attestation, then finalizes from Circle transaction", async () => {
-    const { service, withdrawals, states } = fixture();
+    const { service, withdrawals, states, mintCalls } = fixture();
     const withdrawal = await service.prepareWithdrawal({ amountAtomic: "1", availableAtomic: "5", idempotencyKey: "recover" });
     const row = await withdrawals.update(withdrawal.id, {
       status: "reconciliation_required",
@@ -160,6 +263,7 @@ describe("durable deposit and withdrawal recovery", () => {
     });
     expect(row?.status).toBe("reconciliation_required");
     const submitted = await service.reconcileWithdrawal(withdrawal.id);
+    expect(mintCalls.count).toBe(1);
     expect(submitted.status).toBe("mint_submitted");
     expect(submitted.mintIdempotencyKey).toBe("mint-same-key");
     states.set("mint-same-key", "COMPLETE");

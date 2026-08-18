@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
   addressToBytes32,
+  attestationDigest,
   buildTransferSpec,
   burnIntentDigest,
   createHttpGatewayClient,
@@ -100,21 +101,41 @@ describe("Gateway estimate and transfer HTTP contracts", () => {
     expect(JSON.parse(String(init?.body))).toEqual([{ spec: intent.spec }]);
   });
 
-  it("posts a signed transfer and requires transferId plus attestation", async () => {
+  it("posts a signed transfer with top-level attestation and operator signature", async () => {
     let init: RequestInit | undefined;
     const client = createHttpGatewayClient({
       baseUrl: "https://gateway.example",
       fetch: (async (_url, requestInit) => {
         init = requestInit;
-        return response([{ transferId: "transfer-1", attestation: { payload: "0x1234", signature: "0xabcd" } }]);
+        return response({
+          transferId: "transfer-1",
+          attestation: "0x1234",
+          signature: "0xabcd",
+          fees: {},
+          expirationBlock: "12345",
+        });
       }) as unknown as typeof fetch,
     });
     expect(await client.submit(intent, "0xsig")).toEqual({
       transferId: "transfer-1",
-      attestationHash: expect.any(String),
+      attestationHash: attestationDigest("0x1234"),
     });
     expect(init?.method).toBe("POST");
     expect(JSON.parse(String(init?.body))).toEqual([{ burnIntent: intent, signature: "0xsig" }]);
+  });
+
+  it("fails closed when POST transfer fields are missing", async () => {
+    for (const body of [
+      { attestation: "0x1234", signature: "0xabcd" },
+      { transferId: "transfer-1", signature: "0xabcd" },
+      { transferId: "transfer-1", attestation: "0x1234" },
+    ]) {
+      const client = createHttpGatewayClient({
+        baseUrl: "https://gateway.example",
+        fetch: (async () => response(body)) as unknown as typeof fetch,
+      });
+      await expect(client.submit(intent, "0xsig")).rejects.toThrow();
+    }
   });
 });
 

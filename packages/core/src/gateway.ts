@@ -103,13 +103,11 @@ export function createHttpGatewayClient(config: {
       });
       if (!response.ok) throw new Error(`Gateway transfer HTTP ${response.status}`);
       const raw = await response.json();
-      const first = Array.isArray(raw) ? raw[0] : raw;
-      if (!isRecord(first)) throw new Error("Gateway transfer response malformed");
-      const transferId = requiredString(first.transferId, "transferId");
-      const attestation = isRecord(first.attestation) ? first.attestation : undefined;
-      const payload = attestation && typeof attestation.payload === "string" ? attestation.payload : undefined;
-      if (!payload) throw new Error("Gateway transfer response missing attestation payload");
-      return { transferId, attestationHash: attestationDigest(payload) };
+      if (!isRecord(raw)) throw new Error("Gateway transfer response malformed");
+      const transferId = requiredString(raw.transferId, "transferId");
+      const attestation = requiredString(raw.attestation, "attestation");
+      requiredString(raw.signature, "signature");
+      return { transferId, attestationHash: attestationDigest(attestation) };
     },
 
     async getTransfer(transferId: string) {
