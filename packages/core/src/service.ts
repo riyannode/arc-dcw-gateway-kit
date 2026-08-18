@@ -1,4 +1,377 @@
-import {assertPositiveAmount} from "./amounts.js";import {burnIntentDigest} from "./burn-intent.js";import type {IdentityProvider,WalletStore,WithdrawalStore,DcwWalletProvider,GatewayClient,DepositStore,WithdrawalRecord,DepositRecord,GatewayBalance} from "./types.js";
-const terminal=(s:string)=>["COMPLETE","CONFIRMED","FAILED","DENIED","CANCELLED","EXPIRED"].includes(s.toUpperCase());
-export function createDcwGatewayService(deps:{identity:IdentityProvider;wallets:WalletStore;withdrawals:WithdrawalStore;deposits:DepositStore;dcw:DcwWalletProvider;gateway:GatewayClient}){const {identity,wallets,withdrawals,deposits,dcw,gateway}=deps;const svc={async getOrCreateWallet(){const owner=await identity.getOwner();const old=await wallets.findByOwner(owner.id);if(old)return old;const wallet=await dcw.provisionWallet(owner.id);await wallets.save(wallet);return wallet},async getBalances(){const wallet=await svc.getOrCreateWallet();const onchain=await dcw.getOnchainUsdc(wallet);const gatewayResult=await gateway.getBalances({depositor:wallet.address});return {wallet,onchain,gateway:gatewayResult}},async prepareDeposit(input:{amountAtomic:string;idempotencyKey:string}){const owner=await identity.getOwner();const wallet=await svc.getOrCreateWallet();const existing=await deposits.findByIdempotencyKey(owner.id,input.idempotencyKey);if(existing)return existing;const onchain=await dcw.getOnchainUsdc(wallet);assertPositiveAmount(input.amountAtomic,onchain.atomic.toString());return (await deposits.create({ownerId:owner.id,wallet,amountAtomic:input.amountAtomic,idempotencyKey:input.idempotencyKey})).record},async advanceDeposit(id:string){const row=await deposits.findById(id);if(!row)throw new Error("Deposit not found");const wallet=await svc.getOrCreateWallet();if(row.status==="prepared"){const key=`${row.id}:approval`;try{const tx=await dcw.approveGateway(wallet,row.amountAtomic,key);const next=await deposits.compareAndSet(id,"prepared","approval_submitted",{approvalTransactionId:tx.transactionId});return next??(await deposits.findById(id))!}catch(e){return (await deposits.update(id,{status:"reconciliation_required",errorCode:"approval_ambiguous",errorMessage:e instanceof Error?e.message:String(e)}))!}}if(row.status==="approval_submitted"&&row.approvalTransactionId){const tx=await dcw.getTransaction(row.approvalTransactionId);if(tx.state.toUpperCase()==="CONFIRMED"||tx.state.toUpperCase()==="COMPLETE"){const confirmed=await deposits.compareAndSet(id,"approval_submitted","approval_confirmed");return confirmed??(await deposits.findById(id))!}if(terminal(tx.state)&&!["CONFIRMED","COMPLETE"].includes(tx.state.toUpperCase()))return (await deposits.update(id,{status:"failed",errorCode:"approval_failed",errorMessage:tx.state}))!;return row}const current=await deposits.findById(id);if(current?.status==="approval_confirmed"){try{const tx=await dcw.depositGateway(wallet,current.amountAtomic,`${current.id}:deposit`);const next=await deposits.compareAndSet(id,"approval_confirmed","deposit_submitted",{depositTransactionId:tx.transactionId});return next??(await deposits.findById(id))!}catch(e){return (await deposits.update(id,{status:"reconciliation_required",errorCode:"deposit_ambiguous",errorMessage:e instanceof Error?e.message:String(e)}))!}}if(current?.status==="deposit_submitted"&&current.depositTransactionId){const tx=await dcw.getTransaction(current.depositTransactionId);if(tx.state.toUpperCase()==="CONFIRMED"||tx.state.toUpperCase()==="COMPLETE")return (await deposits.update(id,{status:"finalized"}))!;if(terminal(tx.state))return (await deposits.update(id,{status:"failed",errorCode:"deposit_failed",errorMessage:tx.state}))!}return current??row},async prepareWithdrawal(input:{amountAtomic:string;availableAtomic:string;idempotencyKey:string}){const owner=await identity.getOwner();const wallet=await svc.getOrCreateWallet();const existing=await withdrawals.findByIdempotencyKey(owner.id,input.idempotencyKey);if(existing)return existing;assertPositiveAmount(input.amountAtomic,input.availableAtomic);const spec=await gateway.estimate({version:1,sourceDomain:0,destinationDomain:0,sourceContract:wallet.address,destinationContract:wallet.address,sourceToken:wallet.address,destinationToken:wallet.address,sourceDepositor:wallet.address,destinationRecipient:wallet.address,sourceSigner:wallet.address,destinationCaller:"0x0000000000000000000000000000000000000000",value:input.amountAtomic,salt:`0x${crypto.randomUUID().replaceAll("-","").padEnd(64,"0")}`,hookData:"0x"});return (await withdrawals.create({ownerId:owner.id,wallet,amountAtomic:input.amountAtomic,idempotencyKey:input.idempotencyKey,burnIntent:spec.burnIntent,burnIntentDigest:burnIntentDigest(spec.burnIntent)})).record},async advanceWithdrawal(id:string){const row=await withdrawals.findById(id);if(!row)throw new Error("Withdrawal not found");if(row.status==="prepared"){const wallet=await svc.getOrCreateWallet();const signature=await dcw.signBurnIntent(wallet,row.burnIntent);if(!await withdrawals.compareAndSet(id,"prepared","burn_signed"))return (await withdrawals.findById(id))!;try{const sent=await gateway.submit(row.burnIntent,signature);return (await withdrawals.compareAndSet(id,"burn_signed","gateway_submitted",{transferId:sent.transferId,attestationHash:sent.attestationHash}))??(await withdrawals.findById(id))!}catch(e){return (await withdrawals.update(id,{status:"reconciliation_required",errorCode:"gateway_ambiguous",errorMessage:e instanceof Error?e.message:String(e)}))!}}const current=await withdrawals.findById(id);if(current?.status==="gateway_submitted"&&current.transferId){const t=await gateway.getTransfer(current.transferId);const s=t.status.toLowerCase();if(s==="failed"||s==="expired")return (await withdrawals.update(id,{status:"failed",errorCode:`gateway_${s}`}))!;if(s==="confirmed"||s==="finalized")return (await withdrawals.update(id,{status:"finalized",txHash:t.transactionHash??null}))!;if(t.attestationPayload&&t.attestationSignature){const wallet=await svc.getOrCreateWallet();if(!await withdrawals.compareAndSet(id,"gateway_submitted","mint_submission_pending"))return (await withdrawals.findById(id))!;try{const key=current.mintIdempotencyKey??`${current.id}:mint`;const tx=await dcw.mint(wallet,t.attestationPayload,t.attestationSignature,key);return (await withdrawals.compareAndSet(id,"mint_submission_pending","mint_submitted",{circleTransactionId:tx.transactionId,mintIdempotencyKey:key}))??(await withdrawals.findById(id))!}catch(e){return (await withdrawals.update(id,{status:"reconciliation_required",errorCode:"mint_ambiguous",errorMessage:e instanceof Error?e.message:String(e)}))!}}}return current??row},async reconcileWithdrawal(id:string){const row=await withdrawals.findById(id);if(!row)throw new Error("Withdrawal not found");if(row.status==="mint_submitted"&&row.circleTransactionId){const tx=await dcw.getTransaction(row.circleTransactionId);if(["COMPLETE","CONFIRMED"].includes(tx.state.toUpperCase()))return (await withdrawals.update(id,{status:"finalized",txHash:tx.txHash??null}))!;if(["FAILED","DENIED","CANCELLED"].includes(tx.state.toUpperCase()))return (await withdrawals.update(id,{status:"reconciliation_required",errorCode:"circle_failure_requires_gateway_reconciliation"}))!}return row}};return svc}
-export type DcwGatewayService=ReturnType<typeof createDcwGatewayService>;
+import { assertPositiveAmount } from "./amounts.js";
+import { buildTransferSpec, burnIntentDigest } from "./burn-intent.js";
+import type {
+  DepositRecord,
+  DepositStore,
+  DcwWalletProvider,
+  GatewayClient,
+  GatewayNetworkConfig,
+  IdentityProvider,
+  StoredWallet,
+  WalletStore,
+  WithdrawalRecord,
+  WithdrawalStore,
+} from "./types.js";
+
+const SUCCESS_STATES = new Set(["COMPLETE", "CONFIRMED", "FINALIZED"]);
+const FAILURE_STATES = new Set(["FAILED", "DENIED", "CANCELLED", "EXPIRED"]);
+
+const isSuccess = (state: string) => SUCCESS_STATES.has(state.toUpperCase());
+const isFailure = (state: string) => FAILURE_STATES.has(state.toUpperCase());
+
+function message(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export function createDcwGatewayService(deps: {
+  identity: IdentityProvider;
+  wallets: WalletStore;
+  withdrawals: WithdrawalStore;
+  deposits: DepositStore;
+  dcw: DcwWalletProvider;
+  gateway: GatewayClient;
+  gatewayNetwork: GatewayNetworkConfig;
+}) {
+  const { identity, wallets, withdrawals, deposits, dcw, gateway, gatewayNetwork } = deps;
+
+  async function getOrCreateWallet(): Promise<StoredWallet> {
+    const owner = await identity.getOwner();
+    const existing = await wallets.findByOwner(owner.id);
+    if (existing) return existing;
+    const wallet = await dcw.provisionWallet(owner.id);
+    await wallets.save(wallet);
+    return wallet;
+  }
+
+  async function getBalances() {
+    const wallet = await getOrCreateWallet();
+    const onchain = await dcw.getOnchainUsdc(wallet);
+    const gatewayResult = await gateway.getBalances({
+      depositor: wallet.address,
+      domain: gatewayNetwork.domain,
+    });
+    return { wallet, onchain, gateway: gatewayResult };
+  }
+
+  async function prepareDeposit(input: { amountAtomic: string; idempotencyKey: string }) {
+    const owner = await identity.getOwner();
+    const wallet = await getOrCreateWallet();
+    const existing = await deposits.findByIdempotencyKey(owner.id, input.idempotencyKey);
+    if (existing) return existing;
+    const onchain = await dcw.getOnchainUsdc(wallet);
+    assertPositiveAmount(input.amountAtomic, onchain.atomic.toString());
+    return (
+      await deposits.create({
+        ownerId: owner.id,
+        wallet,
+        amountAtomic: input.amountAtomic,
+        idempotencyKey: input.idempotencyKey,
+      })
+    ).record;
+  }
+
+  async function reconcileDepositRecord(row: DepositRecord): Promise<DepositRecord> {
+    if (row.approvalTransactionId && ["approval_submitted", "reconciliation_required"].includes(row.status)) {
+      try {
+        const tx = await dcw.getTransaction(row.approvalTransactionId);
+        if (isSuccess(tx.state)) {
+          const next = await deposits.compareAndSet(row.id, row.status, "approval_confirmed");
+          row = next ?? (await deposits.findById(row.id)) ?? row;
+        } else if (isFailure(tx.state)) {
+          return (await deposits.update(row.id, {
+            status: "failed",
+            errorCode: "approval_failed",
+            errorMessage: tx.state,
+          })) ?? row;
+        } else {
+          return row;
+        }
+      } catch {
+        return row;
+      }
+    }
+
+    if (row.depositTransactionId && ["deposit_submitted", "reconciliation_required"].includes(row.status)) {
+      try {
+        const tx = await dcw.getTransaction(row.depositTransactionId);
+        if (isSuccess(tx.state)) {
+          return (await deposits.update(row.id, { status: "finalized" })) ?? row;
+        }
+        if (isFailure(tx.state)) {
+          return (await deposits.update(row.id, {
+            status: "failed",
+            errorCode: "deposit_failed",
+            errorMessage: tx.state,
+          })) ?? row;
+        }
+      } catch {
+        return row;
+      }
+    }
+    return (await deposits.findById(row.id)) ?? row;
+  }
+
+  async function advanceDeposit(id: string): Promise<DepositRecord> {
+    let row = await deposits.findById(id);
+    if (!row) throw new Error("Deposit not found");
+    if (row.status === "finalized" || row.status === "failed") return row;
+
+    if (row.status === "reconciliation_required") {
+      row = await reconcileDepositRecord(row);
+      if (row.status === "reconciliation_required") return row;
+      if (row.status === "finalized" || row.status === "failed") return row;
+    }
+
+    const wallet = await getOrCreateWallet();
+    if (row.status === "prepared") {
+      try {
+        const tx = await dcw.approveGateway(wallet, row.amountAtomic, `${row.id}:approval`);
+        return (
+          (await deposits.compareAndSet(row.id, "prepared", "approval_submitted", {
+            approvalTransactionId: tx.transactionId,
+          })) ?? (await deposits.findById(row.id))!
+        );
+      } catch (error) {
+        return (
+          (await deposits.update(row.id, {
+            status: "reconciliation_required",
+            errorCode: "approval_ambiguous",
+            errorMessage: message(error),
+          })) ?? row
+        );
+      }
+    }
+
+    if (row.status === "approval_submitted" && row.approvalTransactionId) {
+      return reconcileDepositRecord(row);
+    }
+
+    if (row.status === "approval_confirmed") {
+      try {
+        const tx = await dcw.depositGateway(wallet, row.amountAtomic, `${row.id}:deposit`);
+        return (
+          (await deposits.compareAndSet(row.id, "approval_confirmed", "deposit_submitted", {
+            depositTransactionId: tx.transactionId,
+          })) ?? (await deposits.findById(row.id))!
+        );
+      } catch (error) {
+        return (
+          (await deposits.update(row.id, {
+            status: "reconciliation_required",
+            errorCode: "deposit_ambiguous",
+            errorMessage: message(error),
+          })) ?? row
+        );
+      }
+    }
+
+    if (row.status === "deposit_submitted") return reconcileDepositRecord(row);
+    return row;
+  }
+
+  async function prepareWithdrawal(input: {
+    amountAtomic: string;
+    availableAtomic: string;
+    idempotencyKey: string;
+  }) {
+    const owner = await identity.getOwner();
+    const wallet = await getOrCreateWallet();
+    const existing = await withdrawals.findByIdempotencyKey(owner.id, input.idempotencyKey);
+    if (existing) return existing;
+    assertPositiveAmount(input.amountAtomic, input.availableAtomic);
+    const transferSpec = buildTransferSpec({
+      walletAddress: wallet.address,
+      amountAtomic: input.amountAtomic,
+      network: gatewayNetwork,
+    });
+    const estimate = await gateway.estimate(transferSpec);
+    return (
+      await withdrawals.create({
+        ownerId: owner.id,
+        wallet,
+        amountAtomic: input.amountAtomic,
+        idempotencyKey: input.idempotencyKey,
+        burnIntent: estimate.burnIntent,
+        burnIntentDigest: burnIntentDigest(estimate.burnIntent),
+      })
+    ).record;
+  }
+
+  async function persistMint(row: WithdrawalRecord, transfer: { attestationPayload: string; attestationSignature: string }, rotateKey = false) {
+    const key = rotateKey || !row.mintIdempotencyKey ? crypto.randomUUID() : row.mintIdempotencyKey;
+    const pending = await withdrawals.compareAndSet(row.id, row.status, "mint_submission_pending", {
+      mintIdempotencyKey: key,
+    });
+    if (!pending) return (await withdrawals.findById(row.id))!;
+    try {
+      const wallet = await getOrCreateWallet();
+      const tx = await dcw.mint(wallet, transfer.attestationPayload, transfer.attestationSignature, key);
+      return (
+        (await withdrawals.compareAndSet(row.id, "mint_submission_pending", "mint_submitted", {
+          circleTransactionId: tx.transactionId,
+          mintIdempotencyKey: key,
+        })) ?? (await withdrawals.findById(row.id))!
+      );
+    } catch (error) {
+      return (
+        (await withdrawals.update(row.id, {
+          status: "reconciliation_required",
+          mintIdempotencyKey: key,
+          errorCode: "mint_submission_failed",
+          errorMessage: message(error),
+        })) ?? (await withdrawals.findById(row.id))!
+      );
+    }
+  }
+
+  async function reconcileWithdrawal(id: string): Promise<WithdrawalRecord> {
+    let row = await withdrawals.findById(id);
+    if (!row) throw new Error("Withdrawal not found");
+    if (row.status === "finalized" || row.status === "failed" || row.status === "expired") return row;
+
+    let circleFailure = false;
+    if (row.circleTransactionId && ["mint_submitted", "reconciliation_required"].includes(row.status)) {
+      try {
+        const tx = await dcw.getTransaction(row.circleTransactionId);
+        if (isSuccess(tx.state)) {
+          return (await withdrawals.update(row.id, {
+            status: "finalized",
+            txHash: tx.txHash ?? row.txHash,
+          })) ?? row;
+        }
+        circleFailure = isFailure(tx.state);
+        if (!circleFailure && row.status === "mint_submitted") return row;
+      } catch {
+        if (row.status === "mint_submitted") return row;
+      }
+    }
+
+    if (!row.transferId) {
+      return (
+        (await withdrawals.update(row.id, {
+          status: "reconciliation_required",
+          errorCode: "missing_authoritative_identifier",
+          errorMessage: "No Gateway transferId or Circle transaction ID is persisted",
+        })) ?? row
+      );
+    }
+
+    let transfer;
+    try {
+      transfer = await gateway.getTransfer(row.transferId);
+    } catch (error) {
+      return (
+        (await withdrawals.update(row.id, {
+          status: "reconciliation_required",
+          errorCode: "gateway_unavailable",
+          errorMessage: message(error),
+        })) ?? row
+      );
+    }
+
+    const status = transfer.status.toLowerCase();
+    if (status === "confirmed" || status === "finalized") {
+      if (!transfer.attestationPayload || !transfer.attestationSignature) {
+        return (await withdrawals.update(row.id, {
+          status: "reconciliation_required",
+          errorCode: "gateway_confirmed_pending_mint",
+          errorMessage: "Gateway transfer is terminal but no mint attestation is available",
+        })) ?? row;
+      }
+      const current = await withdrawals.findById(row.id);
+      if (!current) throw new Error("Withdrawal disappeared during reconciliation");
+      return persistMint(current, {
+        attestationPayload: transfer.attestationPayload,
+        attestationSignature: transfer.attestationSignature,
+      }, circleFailure);
+    }
+    if (status === "failed" || status === "expired") {
+      return (await withdrawals.update(row.id, {
+        status: "failed",
+        errorCode: `gateway_${status}`,
+        errorMessage: `Gateway transfer ${status}`,
+      })) ?? row;
+    }
+    if (status !== "pending") {
+      return (await withdrawals.update(row.id, {
+        status: "reconciliation_required",
+        errorCode: "gateway_unknown_status",
+        errorMessage: `Gateway status ${transfer.status}`,
+      })) ?? row;
+    }
+    if (!transfer.attestationPayload || !transfer.attestationSignature) {
+      return (await withdrawals.update(row.id, {
+        status: "reconciliation_required",
+        errorCode: "missing_attestation",
+        errorMessage: "Gateway pending without attestation",
+      })) ?? row;
+    }
+
+    const current = await withdrawals.findById(row.id);
+    if (!current) throw new Error("Withdrawal disappeared during reconciliation");
+    return persistMint(current, {
+      attestationPayload: transfer.attestationPayload,
+      attestationSignature: transfer.attestationSignature,
+    }, circleFailure);
+  }
+
+  async function advanceWithdrawal(id: string): Promise<WithdrawalRecord> {
+    let row = await withdrawals.findById(id);
+    if (!row) throw new Error("Withdrawal not found");
+    if (["finalized", "failed", "expired"].includes(row.status)) return row;
+
+    if (row.status === "reconciliation_required" || row.status === "mint_submitted") {
+      return reconcileWithdrawal(id);
+    }
+
+    if (row.status === "prepared") {
+      const wallet = await getOrCreateWallet();
+      const signed = await withdrawals.compareAndSet(row.id, "prepared", "burn_signed");
+      if (!signed) return (await withdrawals.findById(row.id))!;
+      try {
+        const signature = await dcw.signBurnIntent(wallet, row.burnIntent);
+        const sent = await gateway.submit(row.burnIntent, signature);
+        return (
+          (await withdrawals.compareAndSet(row.id, "burn_signed", "gateway_submitted", {
+            transferId: sent.transferId,
+            attestationHash: sent.attestationHash,
+          })) ?? (await withdrawals.findById(row.id))!
+        );
+      } catch (error) {
+        return (
+          (await withdrawals.update(row.id, {
+            status: "reconciliation_required",
+            errorCode: "gateway_ambiguous",
+            errorMessage: message(error),
+          })) ?? row
+        );
+      }
+    }
+
+    if (row.status === "burn_signed" || row.status === "gateway_submitted" || row.status === "attestation_received") {
+      return reconcileWithdrawal(id);
+    }
+    if (row.status === "mint_submission_pending") return reconcileWithdrawal(id);
+    return row;
+  }
+
+  async function getDeposit(id: string): Promise<DepositRecord> {
+    const row = await deposits.findById(id);
+    if (!row) throw new Error("Deposit not found");
+    return row;
+  }
+
+  return {
+    getOrCreateWallet,
+    getBalances,
+    getDeposit,
+    prepareDeposit,
+    advanceDeposit,
+    reconcileDeposit: reconcileDepositRecord,
+    prepareWithdrawal,
+    advanceWithdrawal,
+    reconcileWithdrawal,
+  };
+}
+
+export type DcwGatewayService = ReturnType<typeof createDcwGatewayService>;

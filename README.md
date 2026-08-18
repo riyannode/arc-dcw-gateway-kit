@@ -53,7 +53,20 @@ Browser/UI state is never canonical financial state. Reloads call the status/rec
 ## Public usage shape
 
 ```ts
-const service = createDcwGatewayService({ identity, wallets, deposits, withdrawals, dcw, gateway })
+const service = createDcwGatewayService({
+  identity,
+  wallets,
+  deposits,
+  withdrawals,
+  dcw,
+  gateway,
+  gatewayNetwork: {
+    domain: 26,
+    gatewayWalletAddress: process.env.GATEWAY_WALLET_ADDRESS!,
+    gatewayMinterAddress: process.env.GATEWAY_MINTER_ADDRESS!,
+    usdcAddress: process.env.USDC_ADDRESS!,
+  },
+})
 const balances = await service.getBalances()
 
 if (!balances.gateway.ok) {
@@ -85,7 +98,7 @@ await service.advanceWithdrawal(withdrawal.id)
 
 ## Relationship to Circle reference apps
 
-The kit uses Circle DCW SDK operations and Gateway `/v1/estimate`, `/v1/transfer`, and `/v1/transfer/{id}` APIs. It does not replace those SDKs or invent a new Gateway protocol. Its reusable layer is the durable identity→wallet→funding→withdrawal lifecycle and recovery contract.
+The kit uses Circle DCW SDK operations and Gateway `POST /v1/balances`, `POST /v1/estimate`, `POST /v1/transfer`, and `GET /v1/transfer/{id}` APIs. It does not replace those SDKs or invent a new Gateway protocol. Its reusable layer is the durable identity→wallet→funding→withdrawal lifecycle and recovery contract.
 
 ## Arc ecosystem / prior art
 
@@ -108,8 +121,8 @@ Circle credentials belong only in the server runtime. The runnable example retur
 ## Current limitations
 
 - live Arc Testnet / Circle E2E remains pending because credentials are unavailable
-- the example uses in-memory stores and must be replaced with durable application persistence before production
-- the Gateway balance endpoint shape may require configuration for a deployment-specific Circle API version
+- the example uses process-lifetime in-memory stores and must be replaced with durable application persistence before production
+- Circle credentials and network contract addresses must be supplied through server-only configuration
 - PayLabs integration is intentionally not included in this standalone PR
 
 

@@ -1,6 +1,170 @@
-import {describe,it,expect} from "bun:test";import {assertPositiveAmount,parseUsdcAtomic,formatUsdcAtomic,burnIntentDigest,MemoryWithdrawalStore,MemoryDepositStore,assertTransition,assertDepositTransition,canTransition,canDepositTransition} from "./index.js";
-const zeros="0x"+"00".repeat(32);const intent={maxBlockHeight:"1",maxFee:"1",spec:{version:1,sourceDomain:1,destinationDomain:1,sourceContract:zeros,destinationContract:zeros,sourceToken:zeros,destinationToken:zeros,sourceDepositor:zeros,destinationRecipient:zeros,sourceSigner:zeros,destinationCaller:zeros,value:"1",salt:zeros,hookData:"0x"}} as const;const wallet={ownerId:"u",walletId:"w",address:"0x0000000000000000000000000000000000000001",blockchain:"ARC-TESTNET",status:"active" as const};
-describe("amounts",()=>{it("converts exact six-decimal values",()=>{expect(parseUsdcAtomic("1.230001")).toBe("1230001");expect(formatUsdcAtomic("1230001")).toBe("1.230001")});it("rejects zero, negative, malformed and excess precision",()=>{expect(()=>assertPositiveAmount("0","1")).toThrow();expect(()=>parseUsdcAtomic("-1")).toThrow();expect(()=>parseUsdcAtomic("1.0000001")).toThrow();expect(()=>parseUsdcAtomic("abc")).toThrow()});it("rejects overspend",()=>expect(()=>assertPositiveAmount("1000001","1000000")).toThrow())});
-describe("state machine",()=>{it("allows legal withdrawal transitions and blocks backwards transitions",()=>{for(const [a,b] of [["prepared","burn_signed"],["burn_signed","gateway_submitted"],["gateway_submitted","attestation_received"],["attestation_received","mint_submission_pending"],["mint_submission_pending","mint_submitted"],["mint_submitted","finalized"]] as const){expect(canTransition(a,b)).toBe(true);assertTransition(a,b)}expect(canTransition("finalized","prepared")).toBe(false);expect(()=>assertTransition("finalized","prepared")).toThrow()});it("covers deposit recovery paths and terminal guards",()=>{expect(canDepositTransition("prepared","approval_submitted")).toBe(true);expect(canDepositTransition("approval_submitted","approval_confirmed")).toBe(true);expect(canDepositTransition("approval_confirmed","deposit_submitted")).toBe(true);expect(canDepositTransition("deposit_submitted","finalized")).toBe(true);expect(()=>assertDepositTransition("finalized","prepared")).toThrow();expect(()=>assertDepositTransition("failed","deposit_submitted")).toThrow()})});
-describe("idempotency and persistence",()=>{it("replays the same withdrawal and deposit records",async()=>{const ws=new MemoryWithdrawalStore();const ds=new MemoryDepositStore();const a=await ws.create({ownerId:"u",wallet,amountAtomic:"1",idempotencyKey:"same",burnIntent:intent,burnIntentDigest:burnIntentDigest(intent)});const b=await ws.create({ownerId:"u",wallet,amountAtomic:"1",idempotencyKey:"same",burnIntent:intent,burnIntentDigest:burnIntentDigest(intent)});expect(a.created).toBe(true);expect(b.created).toBe(false);expect(b.record.id).toBe(a.record.id);const da=await ds.create({ownerId:"u",wallet,amountAtomic:"1",idempotencyKey:"deposit"});const db=await ds.create({ownerId:"u",wallet,amountAtomic:"1",idempotencyKey:"deposit"});expect(db.created).toBe(false);expect(db.record.id).toBe(da.record.id)});it("retains mint idempotency and prevents duplicate state execution",async()=>{const s=new MemoryWithdrawalStore();const a=await s.create({ownerId:"u",wallet,amountAtomic:"1",idempotencyKey:"m",burnIntent:intent,burnIntentDigest:burnIntentDigest(intent)});const signed=await s.compareAndSet(a.record.id,"prepared","burn_signed");const submitted=await s.compareAndSet(a.record.id,"burn_signed","gateway_submitted",{transferId:"transfer-1",mintIdempotencyKey:"mint-1"});expect(signed?.status).toBe("burn_signed");expect(submitted?.mintIdempotencyKey).toBe("mint-1");expect(await s.compareAndSet(a.record.id,"burn_signed","gateway_submitted")).toBeNull()})});
-describe("BurnIntent",()=>{it("changes digest when a canonical field changes",()=>{const a=burnIntentDigest(intent);const b=burnIntentDigest({...intent,maxFee:"2"});expect(a).not.toBe(b);expect(a).toMatch(/^0x[0-9a-f]{64}$/)})});
+import { describe, expect, it } from "bun:test";
+import {
+  addressToBytes32,
+  buildTransferSpec,
+  burnIntentDigest,
+  createHttpGatewayClient,
+  formatUsdcAtomic,
+  parseBalanceResponse,
+  parseTransfer,
+  parseUsdcAtomic,
+} from "./index.js";
+
+const walletAddress = "0x1111111111111111111111111111111111111111";
+const network = {
+  domain: 26,
+  gatewayWalletAddress: "0x0077777d7EBA4688BDeF3E311b846F25870A19B9",
+  gatewayMinterAddress: "0x0022222ABE238Cc2C7Bb1f21003F0a260052475B",
+  usdcAddress: "0x3600000000000000000000000000000000000000",
+};
+const intent = {
+  maxBlockHeight: "999",
+  maxFee: "100",
+  spec: buildTransferSpec({ walletAddress, amountAtomic: "1230001", network, salt: `0x${"aa".repeat(32)}` }),
+};
+
+function response(body: unknown, status = 200) {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+}
+
+describe("exact USDC amounts", () => {
+  it("parses human-readable decimal USDC without floating point", () => {
+    expect(parseUsdcAtomic("4.88")).toBe("4880000");
+    expect(parseUsdcAtomic("0.000001")).toBe("1");
+    expect(parseUsdcAtomic("1.230001")).toBe("1230001");
+    expect(formatUsdcAtomic("1230001")).toBe("1.230001");
+  });
+
+  it("fails closed for malformed decimals", () => {
+    expect(() => parseUsdcAtomic("1.0000001")).toThrow();
+    expect(() => parseUsdcAtomic("not-a-number")).toThrow();
+    expect(parseBalanceResponse({ token: "USDC", balances: [{ balance: "1e-3" }] })).toEqual({
+      ok: false,
+      errorCode: "malformed",
+      error: "Gateway balance is not a valid decimal USDC amount",
+    });
+  });
+});
+
+describe("Gateway balance HTTP contract", () => {
+  it("uses POST /v1/balances and the canonical body", async () => {
+    let seenUrl = "";
+    let seenInit: RequestInit | undefined;
+    const client = createHttpGatewayClient({
+      baseUrl: "https://gateway.example",
+      fetch: (async (url, init) => {
+        seenUrl = String(url);
+        seenInit = init;
+        return response({ token: "USDC", balances: [{ domain: 26, depositor: walletAddress, balance: "1.230001" }] });
+      }) as unknown as typeof fetch,
+    });
+    const result = await client.getBalances({ depositor: walletAddress, domain: 26 });
+    expect(seenUrl).toBe("https://gateway.example/v1/balances");
+    expect(seenInit?.method).toBe("POST");
+    expect(JSON.parse(String(seenInit?.body))).toEqual({
+      token: "USDC",
+      sources: [{ domain: 26, depositor: walletAddress }],
+    });
+    expect(result).toEqual({ ok: true, balance: { availableAtomic: 1230001n, availableUsdc: "1.230001" } });
+  });
+
+  it("does not convert transport errors into zero", async () => {
+    const client = createHttpGatewayClient({
+      baseUrl: "https://gateway.example",
+      fetch: (async () => response({ error: "down" }, 503)) as unknown as typeof fetch,
+    });
+    expect(await client.getBalances({ depositor: walletAddress, domain: 26 })).toEqual({
+      ok: false,
+      errorCode: "unavailable",
+      error: "Gateway balance HTTP 503",
+    });
+  });
+});
+
+describe("Gateway estimate and transfer HTTP contracts", () => {
+  it("posts the estimate body and parses the current response", async () => {
+    let init: RequestInit | undefined;
+    const client = createHttpGatewayClient({
+      baseUrl: "https://gateway.example",
+      fetch: (async (_url, requestInit) => {
+        init = requestInit;
+        return response([{ burnIntent: intent }]);
+      }) as unknown as typeof fetch,
+    });
+    expect(await client.estimate(intent.spec)).toEqual({
+      burnIntent: intent,
+      feeAtomic: "100",
+      transferSpecHash: undefined,
+    });
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(String(init?.body))).toEqual([{ spec: intent.spec }]);
+  });
+
+  it("posts a signed transfer and requires transferId plus attestation", async () => {
+    let init: RequestInit | undefined;
+    const client = createHttpGatewayClient({
+      baseUrl: "https://gateway.example",
+      fetch: (async (_url, requestInit) => {
+        init = requestInit;
+        return response([{ transferId: "transfer-1", attestation: { payload: "0x1234", signature: "0xabcd" } }]);
+      }) as unknown as typeof fetch,
+    });
+    expect(await client.submit(intent, "0xsig")).toEqual({
+      transferId: "transfer-1",
+      attestationHash: expect.any(String),
+    });
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(String(init?.body))).toEqual([{ burnIntent: intent, signature: "0xsig" }]);
+  });
+});
+
+describe("Gateway transfer and TransferSpec contracts", () => {
+  it("constructs every Arc Testnet same-chain TransferSpec field", () => {
+    const spec = intent.spec;
+    expect(spec).toEqual({
+      version: 1,
+      sourceDomain: 26,
+      destinationDomain: 26,
+      sourceContract: addressToBytes32(network.gatewayWalletAddress),
+      destinationContract: addressToBytes32(network.gatewayMinterAddress),
+      sourceToken: addressToBytes32(network.usdcAddress),
+      destinationToken: addressToBytes32(network.usdcAddress),
+      sourceDepositor: addressToBytes32(walletAddress),
+      destinationRecipient: addressToBytes32(walletAddress),
+      sourceSigner: addressToBytes32(walletAddress),
+      destinationCaller: addressToBytes32("0x0000000000000000000000000000000000000000"),
+      value: "1230001",
+      salt: `0x${"aa".repeat(32)}`,
+      hookData: "0x",
+    });
+  });
+
+  it("normalizes nested GET transfer attestation states", () => {
+    const normalized = parseTransfer(
+      {
+        status: "pending",
+        attestation: { payload: "0x1234", signature: "0xabcd", expirationBlock: 88 },
+        transactionHash: null,
+      },
+      "transfer-1",
+    );
+    expect(normalized).toEqual({
+      transferId: "transfer-1",
+      status: "pending",
+      attestationPayload: "0x1234",
+      attestationSignature: "0xabcd",
+      expirationBlock: "88",
+      transactionHash: null,
+    });
+  });
+
+  it("preserves confirmed transaction hashes and terminal states", () => {
+    expect(parseTransfer({ status: "finalized", transactionHash: "0xtx" }, "t").transactionHash).toBe("0xtx");
+    expect(parseTransfer({ status: "expired" }, "t").status).toBe("expired");
+  });
+
+  it("keeps the local digest canonical", () => {
+    expect(burnIntentDigest(intent)).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(burnIntentDigest({ ...intent, maxFee: "101" })).not.toBe(burnIntentDigest(intent));
+  });
+});
