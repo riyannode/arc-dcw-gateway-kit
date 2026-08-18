@@ -11,7 +11,9 @@ Circle reference applications already demonstrate individual DCW and Gateway ope
 ## What this adds
 
 - application identity → one dedicated DCW mapping
-- `IdentityProvider`, `WalletStore`, and `WithdrawalStore` contracts
+- `IdentityProvider`, `WalletStore`, `DepositStore`, and `WithdrawalStore` contracts
+- typed wallet USDC and Gateway balance results with unavailable/error states
+- resumable approval → Gateway deposit operation with transaction IDs and idempotency
 - canonical BurnIntent persistence and EIP-712 digesting
 - Gateway estimate/transfer/recovery transport
 - persisted transfer IDs, attestation hashes, mint idempotency keys, and Circle transaction IDs
@@ -38,15 +40,38 @@ Browser/UI state is never canonical financial state. Reloads call the status/rec
 
 ## Packages
 
-- `@arc-dcw-gateway-kit/core`: domain types, amount validation, BurnIntent digesting, Gateway HTTP transport, stores, durable service.
-- `@arc-dcw-gateway-kit/circle-dcw`: server-side Circle DCW adapter. Never import this into browser code.
+- `@arc-dcw-gateway-kit/core`: domain types, amount validation, typed wallet/Gateway balances, BurnIntent digesting, Gateway HTTP transport, stores, durable deposit and withdrawal service.
+- `@arc-dcw-gateway-kit/circle-dcw`: server-side Circle DCW adapter for wallet provisioning, USDC balance, approval, Gateway deposit, signing, mint, and transaction lookup. Never import this into browser code.
 - `@arc-dcw-gateway-kit/react`: headless `useDcwGatewayWallet` plus minimal unbranded `DcwGatewayModal`.
 - `@arc-dcw-gateway-kit/next`: thin Web `Response` route adapters.
-- `examples/nextjs`: integration boundary documentation.
+- `examples/nextjs`: runnable Next.js integration using the public package exports.
 
 ## Contracts
 
-`IdentityProvider.getOwner()` returns the authenticated application owner. `WalletStore` owns the owner→wallet uniqueness mapping. `WithdrawalStore` must provide idempotency lookup, canonical create, load, CAS transition, and patch persistence. A SQL adapter should enforce a unique `(owner_id, idempotency_key)` constraint and use `UPDATE ... WHERE status = expected_status` semantics.
+`IdentityProvider.getOwner()` returns the authenticated application owner. `WalletStore` owns the owner→wallet uniqueness mapping. `DepositStore` owns the approval→deposit operation and must retain both Circle transaction IDs. `WithdrawalStore` must provide idempotency lookup, canonical create, load, CAS transition, and patch persistence. A SQL adapter should enforce unique `(owner_id, idempotency_key)` constraints and use `UPDATE ... WHERE status = expected_status` semantics.
+
+## Public usage shape
+
+```ts
+const service = createDcwGatewayService({ identity, wallets, deposits, withdrawals, dcw, gateway })
+const balances = await service.getBalances()
+
+if (!balances.gateway.ok) {
+  // unavailable is not zero; surface the error or retry safely
+  throw new Error(balances.gateway.error)
+}
+
+const deposit = await service.prepareDeposit({ amountAtomic: "1000000", idempotencyKey })
+const depositState = await service.advanceDeposit(deposit.id)
+const withdrawal = await service.prepareWithdrawal({
+  amountAtomic: "500000",
+  availableAtomic: balances.gateway.balance.availableAtomic.toString(),
+  idempotencyKey: withdrawalKey,
+})
+await service.advanceWithdrawal(withdrawal.id)
+```
+
+`advanceDeposit`, `advanceWithdrawal`, and their reconciliation/status calls are server-side operations. React state is only a projection and may be rebuilt after reload.
 
 ## Failure and recovery model
 
@@ -78,7 +103,15 @@ bun run build
 bun test
 ```
 
-Circle credentials belong only in the server runtime. Live Arc/Circle E2E was not executed in this extraction environment because no valid credentials were available; deterministic core tests and local package builds are the verified evidence.
+Circle credentials belong only in the server runtime. The runnable example returns a clear configuration error when credentials are absent. Live Arc/Circle E2E was not executed in this environment because no valid credentials were available; deterministic core tests, package builds, and the Next.js production build are the verified evidence.
+
+## Current limitations
+
+- live Arc Testnet / Circle E2E remains pending because credentials are unavailable
+- the example uses in-memory stores and must be replaced with durable application persistence before production
+- the Gateway balance endpoint shape may require configuration for a deployment-specific Circle API version
+- PayLabs integration is intentionally not included in this standalone PR
+
 
 ## Provenance and license
 

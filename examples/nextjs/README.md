@@ -1,5 +1,12 @@
-# Next.js example
+# Runnable Next.js example
 
-This example is intentionally adapter-first. Supply your own `IdentityProvider`, `WalletStore`, `WithdrawalStore`, Circle credentials, and authenticated route boundary. Keep all Circle credentials server-side. Browser state is only a projection of persisted records.
+This is a minimal server-side example consuming the public workspace package exports. It uses a demo `IdentityProvider` and in-memory stores only to keep the example dependency-free; replace those with application authentication and durable persistence before production.
 
-Typical flow: `getOrCreateWallet()` → balances → `prepareWithdrawal()` → `advanceWithdrawal()` → `reconcileWithdrawal()` after reload.
+```bash
+cp .env.example .env.local
+# Fill CIRCLE_API_KEY and CIRCLE_ENTITY_SECRET on the server only
+bun install
+bun run dev
+```
+
+Without Circle credentials, `/api/wallet` returns a clear `503` configuration error. It never fabricates a wallet, balance, deposit, or withdrawal success. The service has typed wallet/Gateway balances, resumable approval→deposit state, and durable withdrawal state APIs. The in-memory example store resets on process restart; this is intentional and documented as example-only.
