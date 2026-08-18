@@ -1,0 +1,1 @@
+{"compilerOptions":{"target":"ES2022","module":"NodeNext","moduleResolution":"NodeNext","strict":true,"declaration":true,"esModuleInterop":true,"skipLibCheck":true,"jsx":"react-jsx","baseUrl":"."},"include":["packages/**/*.ts","packages/**/*.tsx","examples/**/*.ts","examples/**/*.tsx"]}

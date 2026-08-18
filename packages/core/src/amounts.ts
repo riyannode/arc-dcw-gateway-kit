@@ -1,0 +1,3 @@
+export function parseUsdcAtomic(value:string):string { if(!/^(?:0|[1-9]\d*)(?:\.\d{1,6})?$/.test(value)) throw new Error("Invalid USDC amount"); const [whole,frac=""] = value.split("."); return (BigInt(whole)*1000000n+BigInt((frac+"000000").slice(0,6))).toString(); }
+export function formatUsdcAtomic(value:string):string { const n=BigInt(value); return `${n/1000000n}.${(n%1000000n).toString().padStart(6,"0")}`; }
+export function assertPositiveAmount(amount:string,available:string):void { const n=BigInt(amount), a=BigInt(available); if(n<=0n) throw new Error("Amount must be positive"); if(n>a) throw new Error("Amount exceeds available Gateway balance"); }
